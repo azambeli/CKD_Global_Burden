@@ -1,0 +1,377 @@
+---
+title: "Data Analysis Mkdn"
+output: html_document
+date: "2025-03-20"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r Load and Preprocess}
+##Load Data####
+#Load libraries
+#install.packages("openxlsx", dependencies = TRUE)
+#install.packages("mediation")  # if not already installed
+#install.packages("survey")
+#install.packages("mgcv")
+library(Hmisc)
+library(data.table)
+library(openxlsx)
+library(ggplot2)
+library(dplyr)
+library(car)
+library(mediation)
+library(survey)
+library(mgcv)
+
+
+#Clear existing data and graphics; load RDS data
+graphics.off()
+rm(list = ls())
+
+df_0 <- as.data.frame(readRDS("/Users/alan/Library/CloudStorage/OneDrive-UCSF/Research Time/Transplant - Global/05 Global Modeling (2)/02 Data/Analysis/Clean Data.rds"))
+
+
+
+##Preprocessing####
+#Select Relevant Variables and in sensible order
+relevant_variables <- c("Country",
+                        "Income_Level", 
+                        "Region", 
+                        "Population",
+                        "GDP_PC",
+                        "log_GDP_PC",
+                        "HAQ",
+                        "Gini",
+                        "pMort_IHD",
+                        "Prev_AS",
+                        "CKD_pop",
+                        "pDial_rate",
+                        "pKT_rate",
+                        "pMort_AS",
+                        "pDALYs_AS")
+
+df_all <- df_0[, relevant_variables]
+
+#Exclude countries with missingness >50% in the target variables
+missing_percent <- rowMeans(is.na(df_all))
+excluded_countries <- df_all[missing_percent >= 0.5, "Country"]
+df_all <- df_all[missing_percent < 0.5,]
+
+
+
+#Subset df_all by income level
+LIC <- df_all[df_all$Income_Level == "Low income",]
+LMIC <- df_all[df_all$Income_Level == "Lower-middle income",]
+UMIC <- df_all[df_all$Income_Level == "Upper-middle income",]
+HIC <- df_all[df_all$Income_Level == "High income",]
+
+
+
+
+```
+
+
+```{r Table 1}
+
+##Build Table 1####
+#Proportions within each income level
+prop.table(table(df_all$Income_Level))
+
+###Compute medians grouped by 'Income_Level'####
+#Select numeric variables in data frame
+numeric_vars <- names(df_all)[sapply(df_all, is.numeric)]
+
+#Compute median of each numeric variable, grouped by income level
+medians_grouped <- lapply(df_all[numeric_vars], function(x) aggregate(x ~ Income_Level, data = df_all, median))
+
+# Compute median of each numeric variable across all income levels
+medians_overall <- lapply(df_all[numeric_vars], function(x) median(x, na.rm = TRUE))
+
+
+# Make table of medians grouped by income level
+table_medians <- as.data.frame(t(do.call(cbind, lapply(medians_grouped, function(x) x[, -1]))))
+colnames(table_medians) <- levels(df_all$Income_Level)
+
+# Add a column for overall median to the table
+table_medians$Overall <- unlist(medians_overall)
+
+###Missingness Table####
+#Focus on relevant variables, no duplicates
+unique_vars <- c("Country",
+                        "Income_Level", 
+                        "Region", 
+                        "Population",
+                        "GDP_PC",
+                        "Prev_AS",
+                        "pDial_rate",
+                        "pKT_rate",
+                        "pMort_AS",
+                        "pDALYs_AS")
+df_miss <- df_all[, unique_vars]
+
+#Make table of proportions of missingness for each variable, grouped by income level
+prop_missing <- function(x) mean(is.na(x))
+missing_props <- aggregate(. ~ Income_Level, data = df_miss, FUN = prop_missing, na.action = na.pass)
+missing_props <- as.data.frame(t(missing_props[, -1]))
+colnames(missing_props) <- levels(df_miss$Income_Level)
+
+#Proportion missing, overall
+mean(is.na(df_miss))
+
+#Proportion missing, by variable
+missing_by_var <- data.frame(
+  Variable = names(df_miss),
+  Missing_Proportion = colMeans(is.na(df_miss))
+)
+
+#Add "missingness" variable
+df_miss$missingness <- rowMeans(is.na(df_miss))
+
+#Append column with missingness for each variable, across all income levels
+missing_by_var <- missing_by_var[-2, ]  # Remove the Income_Level row
+missing_props <- cbind(missing_props,missing_by_var[,2])
+colnames(missing_props)[ncol(missing_props)] <- "Overall Missingness"
+
+#Test for association between GDP_PC and missingness
+summary(glm(missingness ~ log(GDP_PC), 
+                 data = df_miss))
+
+###Export tables to Excel####
+wb <- createWorkbook()
+addWorksheet(wb, "Medians")
+addWorksheet(wb, "Missingness")
+writeDataTable(wb, sheet = "Medians", x = table_medians, startCol = 1, startRow = 1, colNames = TRUE, rowNames = TRUE)
+writeDataTable(wb, sheet = "Missingness", x = missing_props, startCol = 1, startRow = 1, colNames = TRUE, rowNames = TRUE)
+saveWorkbook(wb, "R Output Imputed.xlsx", overwrite = TRUE)
+
+
+```
+
+
+```{r Build Function to Organize Model Outputs}
+##Build Table of Regression Coefficients####
+
+
+###Function for building a table of regression coefficients, confidence intervals,and p-values####
+build_coefficient_table <- function(predictor, outcomes, data, covariates=NULL) {
+  # Initialize empty vectors to store coefficients, confidence intervals, and p-values
+  coefficients_vec <- c()
+  ci_lower_vec <- c()
+  ci_upper_vec <- c()
+  p_values_vec <- c()
+  
+  # Loop through each outcome variable
+  for (outcome in outcomes) {
+    # Create formula with or without covariate
+    if (!is.null(covariates)) {
+      formula <- as.formula(paste(outcome, "~", predictor, "+", paste(covariates, collapse = "+")))
+    } else {
+      formula <- as.formula(paste(outcome, "~", predictor))
+    }
+    
+    # Fit the model
+    model <- glm(formula, data = data, family = Gamma(link = "log"))
+    
+    # Extract coefficients and confidence intervals
+    coef <- coefficients(model)[2]
+    ci <- confint(model)[2, ]
+    p_value <- summary(model)$coefficients[2, 4]
+    
+    # Store coefficients and confidence intervals
+    coefficients_vec <- c(coefficients_vec, coef)
+    ci_lower_vec <- c(ci_lower_vec, ci[1])
+    ci_upper_vec <- c(ci_upper_vec, ci[2])
+    
+    # Format p-value
+    if (p_value < 0.0001) {
+      p_values_vec <- c(p_values_vec, "<0.0001")
+    } else {
+      p_values_vec <- c(p_values_vec, sprintf("%.4f", p_value))
+    }
+  }
+  
+  # Create a data frame with coefficients, confidence intervals, and p-values
+  results <- data.frame(
+    Outcome_Variable = outcomes,
+    Coefficient = coefficients_vec,
+    "2.5% CL" = ci_lower_vec,
+    "97.5% CL" = ci_upper_vec,
+    "P-value" = p_values_vec
+  )
+  
+  return(results)
+}
+
+
+```
+
+
+```{r Testing Relationships, echo=FALSE}
+
+##Plotting Each Covariate vs KT Rate (predictor), then vs CKD Mortality (outcome)####
+
+ggplot(df_all, aes(x = log_GDP_PC, y = pKT_rate, color = factor(Income_Level))) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, aes(group = Income_Level), 
+              linetype = "dotted") +  # Add linear trendlines
+  #geom_text(data = subset(df_all, Country %in% outliers_Dial$Country), 
+  #          aes(label = Country), 
+  #          vjust = .1, hjust = -.07, size = 3) +  # Label selected countries
+  labs(x = "GDP_PC, log-transformed", 
+       y = "Proportional KT Rate", 
+       color = "Income Level") +
+  scale_color_manual(values = c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00", "#FFFF33", "#A65628")) +  # Specify colors
+    scale_y_continuous(labels = scales::scientific_format()) +  # Set y-axis to scientific notation
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(),  # Remove major gridlines
+        panel.grid.minor = element_blank(),  # Remove minor gridlines
+        axis.line = element_line()) # Show axis lines
+
+
+
+
+ggplot(df_all, aes(x = pKT_rate, y = pMort_AS, color = factor(Income_Level))) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, aes(group = Income_Level), 
+              linetype = "dotted") +  # Add linear trendlines
+
+  labs(x = "Kidney Transplantation Rate", 
+       y = "CKD Mortality", 
+       color = "Income Level") +
+  scale_color_manual(values = c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00", "#FFFF33", "#A65628")) +  # Specify colors
+
+  scale_y_continuous(labels = scales::scientific_format()) +  # Set y-axis to scientific notation
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(),  # Remove major gridlines
+        panel.grid.minor = element_blank(),  # Remove minor gridlines
+        axis.line = element_line()) # Show axis lines
+
+
+##Building model for each####
+table <- build_coefficient_table("log_GDP_PC", outcomes=c("pDial_rate","pKT_rate", "pMort_AS", "pDALYs_AS"), data=df_all)
+
+summary(glm(pDALYs_AS ~ pDial_rate, 
+                 data = df_all, 
+                 family = Gamma(link = "log")))
+
+```
+
+
+
+
+```{r Diagnostics for Modeling, echo=FALSE}
+
+#Check skew of relevant outcome variables:
+hist(df_all$pKT_rate, main = "Check for Skew")
+hist(df_all$pMort_AS, main = "Check for Skew")
+hist(df_all$pDALYs_AS, main = "Check for Skew")
+#Right skew -> use gamma log-link function
+
+#Most are positively skewed --> use median, log-link gammma
+
+#Check for multicollinearity using VIF
+vif_model <- glm(pMort_AS ~ pKT_rate + log_GDP_PC + HAQ + Gini + pMort_IHD + pDial_rate, 
+                 data = df_all, 
+                 family = Gamma(link = "log"))
+
+vif(vif_model)
+
+# VIF > 5 suggests problematic collinearity -- issue for HAQ
+
+#See if HAQ is correlated with another predictor
+table_cor <- cor(df_all[, c("HAQ", "pKT_rate", "log_GDP_PC", "Gini", "pMort_IHD", "pDial_rate")], use = "pairwise.complete.obs")
+
+#HAQ and GDP are correlated -- check how including one vs. other affects model fit
+model_full <- glm(pMort_AS ~ pKT_rate + HAQ + log_GDP_PC + Gini + pMort_IHD + pDial_rate, 
+                  data = df_all, 
+                  family = Gamma(link = "log"))
+
+model_no_HAQ <- glm(pMort_AS ~ pKT_rate + log_GDP_PC + Gini + pMort_IHD + pDial_rate, 
+                    data = df_all, 
+                    family = Gamma(link = "log"))
+
+model_no_GDP <- glm(pMort_AS ~ pKT_rate + HAQ + Gini + pMort_IHD + pDial_rate, 
+                    data = df_all, 
+                    family = Gamma(link = "log"))
+
+# Compare model fit
+anova(model_full, model_no_HAQ, test = "Chisq")
+anova(model_full, model_no_GDP, test = "Chisq")
+
+AIC(model_full, model_no_HAQ, model_no_GDP)
+
+summary(model_full)
+summary(model_no_HAQ)
+summary(model_no_GDP)
+
+
+#Assess for linear relationship in log space (since planning log-link model)
+pairs(log(df_all$pKT_rate) ~ log_GDP_PC + HAQ + Gini + pMort_IHD + pDial_rate, data = df_all)
+
+
+```
+
+
+```{r Checking for Mediation Effects, echo=FALSE}
+#via KT
+med_kt <- glm(pKT_rate ~ log_GDP_PC, 
+                   data = df_all, 
+                   family = Gamma(link = "log"))
+
+out_kt <-  glm(pMort_AS ~ log_GDP_PC + pKT_rate, 
+                   data = df_all, 
+                   family = Gamma(link = "log"))
+
+mediation_kt <- mediate(med_kt, out_kt, treat = "log_GDP_PC", mediator = "pKT_rate", boot = TRUE, sims = 1000)
+summary(mediation_kt)
+
+#via dialysis
+med_dial <- glm(pDial_rate ~ log_GDP_PC, 
+                   data = df_all, 
+                   family = Gamma(link = "log"))
+
+out_dial <-  glm(pMort_AS ~ log_GDP_PC + pDial_rate, 
+                   data = df_all, 
+                   family = Gamma(link = "log"))
+
+mediation_dial <- mediate(med_dial, out_dial, treat = "log_GDP_PC", mediator = "pDial_rate", boot = TRUE, sims = 1000)
+summary(mediation_dial)
+
+
+```
+
+
+
+```{r Modelling, echo=FALSE}
+#Unweighted Model####
+model_unwt <- glm(pMort_AS ~ log_GDP_PC + pDial_rate + pKT_rate, 
+                   data = df_all, 
+                   family = Gamma(link = "log"))
+summary(model_unwt)
+
+
+
+
+
+#Model with Spline Term ####
+#GAM for non-linear relationship between GDP and KT/Dialysis rates
+model_GAM <- gam(pMort_AS ~ s(log_GDP_PC) + pDial_rate + pKT_rate, 
+                 data = df_all, 
+                 family = Gamma(link = "log"))
+summary(model_GAM)
+
+
+summary(gam(pMort_AS ~ pKT_rate, 
+                 data = df_all, 
+                 family = Gamma(link = "log"), 
+                 weights = CKD_pop))
+
+```
